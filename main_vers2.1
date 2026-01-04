@@ -263,30 +263,30 @@ Bootstrap.moments.NP<-function(B,x,alpha){
   for(i in 1:B){
     boot<-sample.int(nrows,size = nrows,replace = T)
     boot<-x[boot]
-    S<-(1/nrows)*sum(((boot-mean(boot))/sd(boot))^3)
-    K<-(1/nrows)*sum(((boot-mean(boot))/sd(boot))^4)
-    q1[i]<-mean(boot)
-    q2[i]<-sd(boot)
+    S<-(1/nrows)*sum(((boot-mean(boot,na.rm=T))/sd(boot))^3,na.rm=T)
+    K<-(1/nrows)*sum(((boot-mean(boot,na.rm=T))/sd(boot))^4,na.rm=T)
+    q1[i]<-mean(boot,na.rm=T)
+    q2[i]<-sd(boot,na.rm=T)
     q3[i]<-S
     q4[i]<-K
-    q5[i]<-median(boot)
-    q6[i]<-quantile(boot,0.25)
-    q7[i]<-quantile(boot,0.75)
+    q5[i]<-median(boot,na.rm=T)
+    q6[i]<-quantile(boot,0.25,na.rm=T)
+    q7[i]<-quantile(boot,0.75,na.rm=T)
   }
   #statistics
-  b1<-round(mean(x),4)
-  b2<-round(var(x)^0.5,4)
-  s1<-((sum((x-mean(x))^2))/(nrows-1))^0.5
+  b1<-round(mean(x,na.rm=T),4)
+  b2<-round(var(x,na.rm=T)^0.5,4)
+  s1<-((sum((x-mean(x,na.rm=T))^2,na.rm=T))/(nrows-1))^0.5
   se1<-s1*((nrows-1)/nrows)^0.5
-  b3<-round((1/nrows)*sum(((x-mean(x))/se1)^3),4)
-  b4<-round((1/nrows)*sum(((x-mean(x))/se1)^4),4)
+  b3<-round((1/nrows)*sum(((x-mean(x,na.rm=T))/se1)^3,na.rm=T),4)
+  b4<-round((1/nrows)*sum(((x-mean(x,na.rm=T))/se1)^4,na.rm=T),4)
   JB<-nrows/6*(b3^2+0.25*(b4-3)^2)
   P3<-round(pchisq(JB,df=2 ,F,F),4)
-  b5<-round(min(x),4)
-  b6<-round(max(x),4)
-  b7<-round(median(x),4)
-  b8<-round(quantile(x,0.25),4)
-  b9<-round(quantile(x,0.75),4)
+  b5<-round(min(x,na.rm=T),4)
+  b6<-round(max(x,na.rm=T),4)
+  b7<-round(median(x,na.rm=T),4)
+  b8<-round(quantile(x,0.25,na.rm=T),4)
+  b9<-round(quantile(x,0.75,na.rm=T),4)
   #confidence interval
   qsort1<-sort(q1,na.last = T)
   qsort2<-sort(q2,na.last = T)
@@ -296,24 +296,24 @@ Bootstrap.moments.NP<-function(B,x,alpha){
   qsort6<-sort(q6,na.last = T)
   qsort7<-sort(q7,na.last = T)
   #two sided interval mean
-  L1<-round(quantile(qsort1,alpha/2),4)
-  U1<-round(quantile(qsort1,1-alpha/2),4)
+  L1<-round(quantile(qsort1,alpha/2,na.rm=T),4)
+  U1<-round(quantile(qsort1,1-alpha/2,na.rm=T),4)
   #two sided interval standard deviation
-  L2<-round(quantile(qsort2,alpha/2),4)
-  U2<-round(quantile(qsort2,1-alpha/2),4)
+  L2<-round(quantile(qsort2,alpha/2,na.rm=T),4)
+  U2<-round(quantile(qsort2,1-alpha/2,na.rm=T),4)
   #two sided interval skewness
-  L3<-round(quantile(qsort3,alpha/2),4)
-  U3<-round(quantile(qsort3,1-alpha/2),4)
+  L3<-round(quantile(qsort3,alpha/2,na.rm=T),4)
+  U3<-round(quantile(qsort3,1-alpha/2,na.rm=T),4)
   #two sided interval kurtosis
-  L4<-round(quantile(qsort4,alpha/2),4)
-  U4<-round(quantile(qsort4,1-alpha/2),4)
+  L4<-round(quantile(qsort4,alpha/2,na.rm=T),4)
+  U4<-round(quantile(qsort4,1-alpha/2,na.rm=T),4)
   #two sided interval median q-25 and q-75
-  L5<-round(quantile(qsort5,alpha/2),4)
-  U5<-round(quantile(qsort5,1-alpha/2),4)
-  L6<-round(quantile(qsort6,alpha/2),4)
-  U6<-round(quantile(qsort6,1-alpha/2),4)
-  L7<-round(quantile(qsort7,alpha/2),4)
-  U7<-round(quantile(qsort7,1-alpha/2),4)
+  L5<-round(quantile(qsort5,alpha/2,na.rm=T),4)
+  U5<-round(quantile(qsort5,1-alpha/2,na.rm=T),4)
+  L6<-round(quantile(qsort6,alpha/2,na.rm=T),4)
+  U6<-round(quantile(qsort6,1-alpha/2,na.rm=T),4)
+  L7<-round(quantile(qsort7,alpha/2,na.rm=T),4)
+  U7<-round(quantile(qsort7,1-alpha/2,na.rm=T),4)
   # results
   print("output: bootstrap confidence interval of moments non parametric")
   print("")
@@ -776,8 +776,6 @@ data4WE<-data4%>%filter(WE==1)
 data4TH<-data4%>%filter(TH==1)
 data4FR<-data4%>%filter(FR==1)
 
-# add new call.diff2 for the subsample
-
 #parametric duration scan
 #full sample
 Bootstrap.moments.norm(9999,data4$ScanTime,0.05)
@@ -809,8 +807,6 @@ data6WE<-data6%>%filter(WE==1)
 data6TH<-data6%>%filter(TH==1)
 data6FR<-data6%>%filter(FR==1)
 
-# add new call.diff2 for the subsample
-
 #non parametric duration scan
 #full sample
 Bootstrap.moments.NP(9999,data6$ScanTime,0.05)
@@ -839,31 +835,31 @@ Bootstrap.moments.NP(9999,data5$ratio,0.05)
 Bootstrap.moments.NP(9999,data5$numberofcalls,0.05)
 # call frequency
 #full sample
-Bootstrap.moments.NP(9999,data6$call.diff2,0.05)
+Bootstrap.moments.NP(9999,data6$call.diff,0.05)
 #weeks
-Bootstrap.moments.NP(9999,data6W1$call.diff2,0.05)
-Bootstrap.moments.NP(9999,data6W2$call.diff2,0.05)
-Bootstrap.moments.NP(9999,data6W3$call.diff2,0.05)
-Bootstrap.moments.NP(9999,data6W4$call.diff2,0.05)
+Bootstrap.moments.NP(9999,data6W1$call.diff,0.05)
+Bootstrap.moments.NP(9999,data6W2$call.diff,0.05)
+Bootstrap.moments.NP(9999,data6W3$call.diff,0.05)
+Bootstrap.moments.NP(9999,data6W4$call.diff,0.05)
 #days
-Bootstrap.moments.NP(9999,data6MO$call.diff2,0.05)
-Bootstrap.moments.NP(9999,data6TU$call.diff2,0.05)
-Bootstrap.moments.NP(9999,data6WE$call.diff2,0.05)
-Bootstrap.moments.NP(9999,data6TH$call.diff2,0.05)
-Bootstrap.moments.NP(9999,data6FR$call.diff2,0.05)  
+Bootstrap.moments.NP(9999,data6MO$call.diff,0.05)
+Bootstrap.moments.NP(9999,data6TU$call.diff,0.05)
+Bootstrap.moments.NP(9999,data6WE$call.diff,0.05)
+Bootstrap.moments.NP(9999,data6TH$call.diff,0.05)
+Bootstrap.moments.NP(9999,data6FR$call.diff,0.05)  
 #full sample
-Bootstrap.moments.NP(9999,data4$call.diff2,0.05)
+Bootstrap.moments.NP(9999,data4$call.diff,0.05)
 #weeks
-Bootstrap.moments.NP(9999,data4W1$call.diff2,0.05)
-Bootstrap.moments.NP(9999,data4W2$call.diff2,0.05)
-Bootstrap.moments.NP(9999,data4W3$call.diff2,0.05)
-Bootstrap.moments.NP(9999,data4W4$call.diff2,0.05)
+Bootstrap.moments.NP(9999,data4W1$call.diff,0.05)
+Bootstrap.moments.NP(9999,data4W2$call.diff,0.05)
+Bootstrap.moments.NP(9999,data4W3$call.diff,0.05)
+Bootstrap.moments.NP(9999,data4W4$call.diff,0.05)
 #days
-Bootstrap.moments.NP(9999,data4MO$call.diff2,0.05)
-Bootstrap.moments.NP(9999,data4TU$call.diff2,0.05)
-Bootstrap.moments.NP(9999,data4WE$call.diff2,0.05)
-Bootstrap.moments.NP(9999,data4TH$call.diff2,0.05)
-Bootstrap.moments.NP(9999,data4FR$call.diff2,0.05)
+Bootstrap.moments.NP(9999,data4MO$call.diff,0.05)
+Bootstrap.moments.NP(9999,data4TU$call.diff,0.05)
+Bootstrap.moments.NP(9999,data4WE$call.diff,0.05)
+Bootstrap.moments.NP(9999,data4TH$call.diff,0.05)
+Bootstrap.moments.NP(9999,data4FR$call.diff,0.05)
 
 # monte-carlo study non-parametric methods used treatment 2 -------------------------------------------
 
