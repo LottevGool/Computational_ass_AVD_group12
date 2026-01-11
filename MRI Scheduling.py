@@ -1,4 +1,3 @@
-from collections import deque
 import os
 import simpy
 import csv
@@ -47,10 +46,10 @@ for d in data:
 for d in data:
     d["arrival_time"] = (converted_days[d["Date"]] * workday + d["Time"] * 60)
 
-# Helper functions
-def converter_simulationtime_clocktime(simulation_time):
-    day = int(simulation_time // workday)
-    minutes_elapsed_since_8 = simulation_time % workday
+# Helper function
+def converter_timeindex_clocktime(time_index):
+    day = int(time_index // workday)
+    minutes_elapsed_since_8 = time_index % workday
     hour = 8 + int(minutes_elapsed_since_8 // 60)
     minute = int(minutes_elapsed_since_8 % 60)
     return day, f"{hour:02d}:{minute:02d}"
@@ -134,7 +133,9 @@ class Scheduler:
 
         return {
             "machine": machine.name,
+            "patient_type": patient_type,
             "day": appointment_day,
+            "arrival_time": arrival_time,
             "start_scheduled": start_scheduled,
             "finish_scheduled": finish_scheduled,
             "start_true": start_true,
@@ -143,16 +144,17 @@ class Scheduler:
 
 
 # Each patient is SimPy process
-def patient(environ, scheduler, data, patient_ID):
+def patient(environ, scheduler, data, patient_ID, simulation_results):
     arrival_time = data["arrival_time"]
-    call_day, call_time = converter_simulationtime_clocktime(arrival_time)
+    call_day, call_time = converter_timeindex_clocktime(arrival_time)
 
     # Store when the patient has called for an appointment
     yield environ.timeout(arrival_time - environ.now)
-    print(f"Day {call_day}: Patient {patient_ID} calls at {call_time}")
+    # print(f"Day {call_day}: Patient {patient_ID} calls at {call_time}")
 
     # Schedule patient after they've called
     result = scheduler.assign(data)
+    simulation_results.append(result)
 
     day = result["day"]
     machine = result["machine"]
@@ -160,58 +162,259 @@ def patient(environ, scheduler, data, patient_ID):
     finish_scheduled = result["finish_scheduled"]
 
     # Scheduled slot
-    start_scheduled_day, start_scheduled_time = converter_simulationtime_clocktime(start_scheduled)
-    finish_scheduled_day, finish_scheduled_time = converter_simulationtime_clocktime(finish_scheduled)
-    print(f"Day {day}: patient {patient_ID} scheduled on {machine} in slot: {start_scheduled_time} to {finish_scheduled_time}")
+    start_scheduled_day, start_scheduled_time = converter_timeindex_clocktime(start_scheduled)
+    finish_scheduled_day, finish_scheduled_time = converter_timeindex_clocktime(finish_scheduled)
+    # print(f"Day {day}: patient {patient_ID} scheduled on {machine} in slot: {start_scheduled_time} to {finish_scheduled_time}")
 
     # Check if there are any delays in the schedule by reporting the true start and finish
-    # start and finish times reset each day but the simulation doesnt distinguish days and keeps counting
+    # start and finish times reset each day but the simulation does not distinguish days and keeps counting
+    # Hence, the time in day is converted to a "total time" in the simulation
 
     # Actual start time of the scan
     total_start = day * workday + result["start_true"]
-    start_true_day, start_true_time = converter_simulationtime_clocktime(total_start)
+    start_true_day, start_true_time = converter_timeindex_clocktime(total_start)
     yield environ.timeout(total_start - environ.now)
-    print(f"Day {day}: patient {patient_ID} starts scan at {start_true_time} on {machine}")
+    # print(f"Day {day}: patient {patient_ID} starts scan at {start_true_time} on {machine}")
 
     # Actual time the scan finishes
     total_finish = day * workday + result["finish_true"]
-    finish_true_day, finish_true_time = converter_simulationtime_clocktime(total_finish)
+    finish_true_day, finish_true_time = converter_timeindex_clocktime(total_finish)
     yield environ.timeout(total_finish - environ.now)
-    print(f"Day {day}: patient {patient_ID} finishes scan at {finish_true_time} on {machine}")
+    # print(f"Day {day}: patient {patient_ID} finishes scan at {finish_true_time} on {machine}")
 
-# Calculate overtime per machine in minutes
-def overtime_computer(machine):
-    daily_overtime = {}
+# Next, some functions to calculate KPIs are defined
+
+# Number of patients of each type
+def type_counter(data):
+    type1_count = 0
+    type2_count = 0
+    for d in data:
+        if d["PatientType"] == 1:
+            type1_count += 1
+        elif d["PatientType"] == 2:
+            type2_count += 1
+    return type1_count, type2_count
+
+# Waiting time from call to start of appointment
+# THRESHOLD IS IN WORKINGDAYS, i.e. a week consists of 5 workingdays
+def waitingtime(simulation_results, threshold):
+    patient_waiting_times = []
+    significant_wait_count = 0
+
+    # Instead of working hours we now also consider "non-working hours as the patient also has to wait then.
+    for result in simulation_results:
+        waiting_time = (result["start_scheduled"] + result["day"] * (24 * 60)) - result["arrival_time"]
+        patient_waiting_times.append(waiting_time)
+        if waiting_time > (threshold * (24*60)):
+            significant_wait_count += 1
+
+    mean = sum(patient_waiting_times) / len(patient_waiting_times)
+    variance = sum((waiting_time - mean) ** 2 for waiting_time in patient_waiting_times) / len(patient_waiting_times)
+    minimum = min(patient_waiting_times)
+    maximum = max(patient_waiting_times)
+    patient_wait = patient_waiting_times
+    significant_wait = (significant_wait_count / len(patient_waiting_times)) * 100
+
+    return {
+        "mean": mean,
+        "variance": variance,
+        "minimum": minimum,
+        "maximum": maximum,
+        "waiting time per patient": patient_wait,
+        "percentage of patients with waiting time above threshold": significant_wait
+    }
+
+# Downtime per machine / facility
+def downtime(machine, simulation_results):
+    daily_downtime = []
+
+    for day in machine.scheduled_slots:
+        total_scheduled = 0
+
+        # Each machine is active as long as a patient is assigned to a slot
+        # So, downtime of a machine is workday - assigned number of slots * slot_length
+        appointments = [result for result in simulation_results
+                    if result["machine"] == machine.name and result["day"] == day]
+        total_scheduled = sum(result["finish_scheduled"] - result["start_scheduled"] for result in appointments)
+
+        downtime = max(0, workday - total_scheduled)
+        daily_downtime.append(downtime)
+
+    mean = sum(daily_downtime) / len(daily_downtime)
+    variance = sum((downtime - mean) ** 2 for downtime in daily_downtime) / len(daily_downtime)
+    minimum = min(daily_downtime)
+    maximum = max(daily_downtime)
+
+    return {
+        "mean": mean,
+        "variance": variance,
+        "minimum": minimum,
+        "maximum": maximum,
+        "downtime per day": daily_downtime
+    }
+
+# Throughput per day per machine / facility
+def throughput(machine, simulation_results):
+    daily_throughput = []
+
+    for day in machine.scheduled_slots:
+        appointments = [result for result in simulation_results
+                    if result["machine"] == machine.name and result["day"] == day]
+        throughput = len(appointments)
+        daily_throughput.append(throughput)
+
+    mean = sum(daily_throughput) / len(daily_throughput)
+    variance = sum((throughput - mean) ** 2 for throughput in daily_throughput) / len(daily_throughput)
+    minimum = min(daily_throughput)
+    maximum = max(daily_throughput)
+
+    return {
+        "mean": mean,
+        "variance": variance,
+        "minimum": minimum,
+        "maximum": maximum,
+        "throughput per day": daily_throughput
+    }
+
+# Overtime per machine / facility
+def overtime(machine):
+    daily_overtime = []
+
     for day, finish in machine.daily_finish_time.items():
-        daily_overtime[day] = max(0, finish - workday)
-    return daily_overtime
+        overtime = max(0, finish - workday)
+        daily_overtime.append(overtime)
+
+    mean = sum(daily_overtime) / len(daily_overtime)
+    variance = sum((overtime - mean) ** 2 for overtime in daily_overtime) / len(daily_overtime)
+    minimum = min(daily_overtime)
+    maximum = max(daily_overtime)
+
+    return {
+        "mean": mean,
+        "variance": variance,
+        "minimum": minimum,
+        "maximum": maximum,
+        "overtime per day": daily_overtime
+    }
+
+# Delay from the start of an appointment to when the patient is actually seen
+# THRESHOLD IS IN MINUTES
+def delay(simulation_results, threshold):
+    patient_delays = []
+    delay_count = 0
+    total_delay_delayed = 0
+    significant_delay_count = 0
+
+    for result in simulation_results:
+        delay = max(0, result["start_true"] - result["start_scheduled"])
+        patient_delays.append(delay)
+        if delay > 0:
+            delay_count += 1
+            total_delay_delayed += delay
+            if delay > threshold:
+                significant_delay_count += 1
+
+    mean = sum(patient_delays) / len(patient_delays)
+    variance = sum((delay - mean) ** 2 for delay in patient_delays) / len(patient_delays)
+    minimum = min(patient_delays)
+    maximum = max(patient_delays)
+    delay_percentage = (delay_count / len(patient_delays)) * 100
+    mean_delay_delayed = (total_delay_delayed / delay_count) * 100
+    significant_delay = (significant_delay_count / len(patient_delays)) * 100
+
+    return {
+        "mean": mean,
+        "variance": variance,
+        "minimum": minimum,
+        "maximum": maximum,
+        "delays per day": patient_delays,
+        "percentage of delayed patients": delay_percentage,
+        "mean delay of all delayed patients": mean_delay_delayed,
+        "percentage of patients with delay above threshold": significant_delay
+    }
 
 # Run simulation
 def run_simulation(system_type):
     environ = simpy.Environment()
     scheduler = Scheduler(system_type)
+    simulation_results = []
 
     for patient_ID, d in enumerate(data):
-        environ.process(patient(environ, scheduler, d, patient_ID))
+        environ.process(patient(environ, scheduler, d, patient_ID, simulation_results))
 
     environ.run()
 
-    # Overtime calculation
+    # KPI's corresponding to the schedule found in the simulation
+    print(f"\n----- KPI REPORT for the {system} system -----")
+
+    # Patient type
+    type1_count, type2_count = type_counter(data)
+
+    print("Number of patients of each type:")
+    print(f" Type 1: {type1_count}")
+    print(f" Type 2: {type2_count}\n")
+
+    # Waiting time
+    waitingtime_kpis = waitingtime(simulation_results, 5)           #n.b. threshold should be in WORKINGDAYS
+
+    print(f"Waiting time from call to start of scan:")
+    print(f"Average waiting time: {waitingtime_kpis['mean']:.1f} minutes")
+    print(f"Variance in waiting time: {waitingtime_kpis['variance']:.1f}")
+    print(f"Minimum waiting time: {waitingtime_kpis['minimum']:.1f} minutes")
+    print(f"Maximum waiting: {waitingtime_kpis['maximum']:.1f} minutes")
+    print(f"Percentage of patients with a waiting time above the threshold: {waitingtime_kpis['percentage of patients with waiting time above threshold']:.1f}%\n")
+
+
     if system_type == "old":
         machines = [scheduler.MRI_type1, scheduler.MRI_type2]
     else:
         machines = scheduler.machines
 
-    print(f"Overtime Computation:")
+    # Downtime
+    print(f"Downtime per Facility:")
     for m in machines:
-        daily_overtime = overtime_computer(m)
-        total_overtime = sum(daily_overtime.values())
+        downtime_kpis = downtime(m, simulation_results)
 
-        print(f"{m.name}:")
-        for day, overtime in daily_overtime.items():
-            print(f"Overtime on day {day}: {overtime:.0f} minutes")
-        print(f"Total overtime: {total_overtime:.0f} minutes\n")
+        print(f"Facility {m.name}:")
+        print(f"Average downtime: {downtime_kpis['mean']:.1f} minutes")
+        print(f"Variance in downtime: {downtime_kpis['variance']:.1f}")
+        print(f"Minimum downtime: {downtime_kpis['minimum']:.1f} minutes")
+        print(f"Maximum downtime: {downtime_kpis['maximum']:.1f} minutes \n")
 
-# Choose what system to use: "old" or "new"
-run_simulation("old")
+    # Throughput
+    print(f"Throughput per Facility:")
+    for m in machines:
+        throughput_kpis = throughput(m, simulation_results)
 
+        print(f"Facility {m.name}:")
+        print(f"Average throughput: {throughput_kpis['mean']:.1f} patients")
+        print(f"Variance in throughput: {throughput_kpis['variance']:.1f}")
+        print(f"Minimum throughput: {throughput_kpis['minimum']:.0f} patients")
+        print(f"Maximum throughput: {throughput_kpis['maximum']:.0f} patients \n")
+
+    # Overtime
+    print(f"Overtime per Facility:")
+    for m in machines:
+        overtime_kpis = overtime(m)
+
+        print(f"Facility {m.name}:")
+        print(f"Average overtime: {overtime_kpis['mean']:.1f} minutes")
+        print(f"Variance in overtime: {overtime_kpis['variance']:.1f}")
+        print(f"Minimum overtime: {overtime_kpis['minimum']:.1f} minutes")
+        print(f"Maximum overtime: {overtime_kpis['maximum']:.1f} minutes \n")
+
+    # Delay
+    delay_kpis = delay(simulation_results, 60)          #n.b. threshold should be in MINUTES
+
+    print(f"Delay from scheduled to the true start of the scan:")
+    print(f"Average delay: {delay_kpis['mean']:.1f} minutes")
+    print(f"Variance in delay: {delay_kpis['variance']:.1f}")
+    print(f"Minimum delay: {delay_kpis['minimum']:.1f} minutes")
+    print(f"Maximum delay: {delay_kpis['maximum']:.1f} minutes")
+    print(f"Percentage of delayed patients: {delay_kpis['percentage of delayed patients']:.1f}%")
+    print(f"Average delay of delayed patients: {delay_kpis['mean delay of all delayed patients']:.1f} minutes")
+    print(f"Percentage of patients with a delay above the threshold: {delay_kpis['percentage of patients with delay above threshold']:.1f}%\n")
+
+systems = ["old", "new"]
+for system in systems:
+    run_simulation(system)
