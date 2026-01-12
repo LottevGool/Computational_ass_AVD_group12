@@ -867,3 +867,408 @@ Bootstrap.moments.NP(9999,data4FR$call.diff,0.05)
 Monte.carlo.sim.norm(B = 999, sim = 200, sample = 50, alpha = 0.05)
 #under poisson(1) of data
 Monte.carlo.sim.pois(B = 999, sim = 200, sample = 50, alpha = 0.05)
+
+
+# ============================================================
+# PART 2 — SCHEDULING SIMULATION
+# ============================================================
+
+# ============================================================
+# MRI Scheduling Simulation — Old vs New Policy
+# Slot lengths: Type 1 = 30 min, Type 2 = 54 min
+# ============================================================
+
+rm(list=ls())
+set.seed(299792458)
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(lubridate)
+})
+
+# -----------------------------
+# USER SETTINGS
+# -----------------------------
+CSV_PATH <- "ScanRecords.csv"
+
+SLOT_T1 <- 30  # minutes
+SLOT_T2 <- 54  # minutes
+
+DAY_START <- 8 * 60   # 08:00 in minutes
+DAY_END   <- 17 * 60  # 17:00 in minutes
+DAY_LEN   <- DAY_END - DAY_START # 540
+
+N_REP <- 2000     
+BUFFER_DAYS <- 30 # extra working days so everyone gets scheduled
+
+# -----------------------------
+# 1) LOAD DATA + ESTIMATE INPUTS
+# -----------------------------
+data <- read.csv(CSV_PATH)
+stopifnot(all(c("Date","Time","Duration","PatientType") %in% names(data)))
+
+data1 <- data %>%
+  rename(ScanTime = Duration) %>%
+  mutate(
+    # robust parse (handles m/d/y, d/m/y, y-m-d, etc.)
+    Date_parsed = as.Date(parse_date_time(as.character(Date),
+                                          orders = c("mdy","dmy","ymd","m/d/Y","d/m/Y","Y-m-d"),
+                                          exact = FALSE)),
+    Time = as.numeric(Time),
+    ScanTime = as.numeric(ScanTime) * 60 # convert to minutes (matches your analysis)
+  )
+
+if (any(is.na(data1$Date_parsed))) {
+  bad <- unique(data$Date[is.na(data1$Date_parsed)])
+  print("Unparsed Date examples:")
+  print(head(bad, 20))
+  stop("Date parsing failed for some rows. Fix Date format in CSV or add another order.")
+}
+
+# Workdays in the dataset (Mon-Fri)
+workdays <- data1 %>%
+  distinct(Date_parsed) %>%
+  filter(!(weekdays(Date_parsed) %in% c("Saturday","Sunday"))) %>%
+  arrange(Date_parsed)
+
+n_workdays <- nrow(workdays)
+if (n_workdays < 5) stop("Too few workdays detected — check Date parsing.")
+
+# Split types
+data_T1 <- data1 %>% filter(PatientType == "Type 1")
+data_T2 <- data1 %>% filter(PatientType == "Type 2")
+
+if (nrow(data_T1) < 30 || nrow(data_T2) < 30) {
+  warning("Low sample size for one of the types; simulation will still run but uncertainty increases.")
+}
+
+# Type 1 scan-time parameters (Normal)
+mu1 <- mean(data_T1$ScanTime, na.rm = TRUE)
+sd1 <- sd(data_T1$ScanTime, na.rm = TRUE)
+
+# Type 2 scan-time empirical sample (nonparametric resampling)
+t2_emp <- data_T2$ScanTime
+t2_emp <- t2_emp[is.finite(t2_emp) & t2_emp > 0]
+if (length(t2_emp) < 20) stop("Too few valid Type 2 scan times to resample.")
+
+# Arrival rates per WORKDAY from dataset
+# Count calls per day by type
+daily_counts <- data1 %>%
+  filter(!(weekdays(Date_parsed) %in% c("Saturday","Sunday"))) %>%
+  count(Date_parsed, PatientType, name = "n") %>%
+  tidyr::complete(Date_parsed = unique(workdays$Date_parsed),
+                  PatientType = c("Type 1","Type 2"),
+                  fill = list(n = 0)) %>%
+  arrange(Date_parsed, PatientType)
+
+lambda1 <- mean(daily_counts$n[daily_counts$PatientType=="Type 1"])
+lambda2 <- mean(daily_counts$n[daily_counts$PatientType=="Type 2"])
+
+cat("Estimated inputs from CSV:\n")
+cat(sprintf("Type 1 scan time Normal(mu=%.3f, sd=%.3f) minutes\n", mu1, sd1))
+cat(sprintf("Type 1 calls/day lambda1 = %.3f\n", lambda1))
+cat(sprintf("Type 2 calls/day lambda2 = %.3f\n", lambda2))
+cat(sprintf("Workdays in dataset = %d\n\n", n_workdays))
+
+# -----------------------------
+# 2) HELPERS
+# -----------------------------
+
+# Generate call arrivals within a workday: N ~ Poisson(lambda), times uniform in [08:00,17:00)
+gen_calls_one_day <- function(day_index, lambda, type_label) {
+  n <- rpois(1, lambda)
+  if (n == 0) return(NULL)
+  times <- runif(n, min = DAY_START, max = DAY_END) # minutes
+  tibble(
+    call_day = day_index,
+    call_time = times,
+    PatientType = type_label
+  ) %>% arrange(call_time)
+}
+
+# Create a list of workdays: original month + buffer days (working days only)
+make_workday_calendar <- function(start_date, n_main, buffer) {
+  # generate enough calendar days then filter to Mon-Fri
+  all_days <- seq.Date(from = start_date, by = "day", length.out = (n_main + buffer) * 2)
+  wd <- all_days[!(weekdays(all_days) %in% c("Saturday","Sunday"))]
+  wd[1:(n_main + buffer)]
+}
+
+# Planned schedule structure: per day, per machine, store planned_end (minutes-from-08:00) and appointments
+init_schedule <- function(n_days_total) {
+  # For each day and each machine: planned_end counts minutes from DAY_START
+  # Also store vector of patient types (for later duration draws)
+  list(
+    m1_end = rep(0, n_days_total),
+    m2_end = rep(0, n_days_total),
+    m1_types = vector("list", n_days_total),
+    m2_types = vector("list", n_days_total),
+    m1_slots = vector("list", n_days_total), # store planned slot lengths for utilization/balance
+    m2_slots = vector("list", n_days_total)
+  )
+}
+
+slot_len_for_type <- function(pt) ifelse(pt == "Type 1", SLOT_T1, SLOT_T2)
+
+# Find earliest feasible (day, machine) starting from earliest_day
+# policy = "old" restricts machines by type, "new" allows both
+find_earliest_slot <- function(sch, earliest_day, pt, policy) {
+  L <- slot_len_for_type(pt)
+  
+  if (policy == "old") {
+    # fixed machine by type
+    machine <- if (pt == "Type 1") "m1" else "m2"
+    for (d in earliest_day:length(sch$m1_end)) {
+      if (machine == "m1") {
+        if (sch$m1_end[d] + L <= DAY_LEN) return(list(day=d, machine="m1"))
+      } else {
+        if (sch$m2_end[d] + L <= DAY_LEN) return(list(day=d, machine="m2"))
+      }
+    }
+  } else {
+    # new: choose earliest day; within day choose machine that fits and yields earlier planned time
+    for (d in earliest_day:length(sch$m1_end)) {
+      ok1 <- (sch$m1_end[d] + L <= DAY_LEN)
+      ok2 <- (sch$m2_end[d] + L <= DAY_LEN)
+      if (ok1 || ok2) {
+        if (ok1 && ok2) {
+          # pick machine with smaller planned end (earlier planned slot start)
+          if (sch$m1_end[d] <= sch$m2_end[d]) return(list(day=d, machine="m1"))
+          return(list(day=d, machine="m2"))
+        } else if (ok1) {
+          return(list(day=d, machine="m1"))
+        } else {
+          return(list(day=d, machine="m2"))
+        }
+      }
+    }
+  }
+  
+  stop("No feasible slot found — increase BUFFER_DAYS or check slot lengths/capacity.")
+}
+
+# Add appointment to schedule (planned)
+add_to_schedule <- function(sch, day, machine, pt) {
+  L <- slot_len_for_type(pt)
+  if (machine == "m1") {
+    sch$m1_types[[day]] <- c(sch$m1_types[[day]], pt)
+    sch$m1_slots[[day]] <- c(sch$m1_slots[[day]], L)
+    sch$m1_end[day] <- sch$m1_end[day] + L
+  } else {
+    sch$m2_types[[day]] <- c(sch$m2_types[[day]], pt)
+    sch$m2_slots[[day]] <- c(sch$m2_slots[[day]], L)
+    sch$m2_end[day] <- sch$m2_end[day] + L
+  }
+  sch
+}
+
+# Simulate execution of one day for one machine:
+# planned slot starts at cumulative planned time (from 0), but actual starts can be delayed by overruns.
+simulate_machine_day <- function(pt_vec, slot_vec) {
+  # pt_vec: ordered appointment types for the day
+  # slot_vec: planned slot lengths (minutes)
+  if (length(pt_vec) == 0) {
+    return(list(busy=0, overtime=0, last_end=0))
+  }
+  
+  # draw durations for each appointment
+  dur <- numeric(length(pt_vec))
+  for (i in seq_along(pt_vec)) {
+    if (pt_vec[i] == "Type 1") {
+      # Normal duration in minutes; truncate at >0
+      x <- rnorm(1, mean = mu1, sd = sd1)
+      while (!is.finite(x) || x <= 0) x <- rnorm(1, mean = mu1, sd = sd1)
+      dur[i] <- x
+    } else {
+      dur[i] <- sample(t2_emp, size = 1)
+    }
+  }
+  
+  # planned start times (minutes from DAY_START)
+  planned_start <- c(0, cumsum(slot_vec))[1:length(slot_vec)]
+  
+  # actual start/end
+  actual_start <- numeric(length(dur))
+  actual_end <- numeric(length(dur))
+  
+  for (i in seq_along(dur)) {
+    if (i == 1) {
+      actual_start[i] <- planned_start[i]
+    } else {
+      actual_start[i] <- max(planned_start[i], actual_end[i-1])
+    }
+    actual_end[i] <- actual_start[i] + dur[i]
+  }
+  
+  busy <- sum(dur)
+  last_end <- actual_end[length(actual_end)]
+  overtime <- max(0, last_end - DAY_LEN)
+  
+  list(busy=busy, overtime=overtime, last_end=last_end)
+}
+
+# Summarise KPIs from simulation outputs
+kpi_summary <- function(wait_days, overtime_m1, overtime_m2, busy_m1, busy_m2, backlog) {
+  overtime_total <- overtime_m1 + overtime_m2
+  util_m1 <- busy_m1 / DAY_LEN
+  util_m2 <- busy_m2 / DAY_LEN
+  
+  tibble(
+    wait_mean = mean(wait_days),
+    wait_median = median(wait_days),
+    wait_p90 = as.numeric(quantile(wait_days, 0.90)),
+    wait_p95 = as.numeric(quantile(wait_days, 0.95)),
+    wait_max = max(wait_days),
+    
+    svc_le_1 = mean(wait_days <= 1),
+    svc_le_2 = mean(wait_days <= 2),
+    svc_le_5 = mean(wait_days <= 5),
+    
+    ot_mean = mean(overtime_total),
+    ot_p95 = as.numeric(quantile(overtime_total, 0.95)),
+    ot_prob = mean(overtime_total > 0),
+    ot_max = max(overtime_total),
+    
+    util1_mean = mean(util_m1),
+    util2_mean = mean(util_m2),
+    util_system = mean((busy_m1 + busy_m2) / (2 * DAY_LEN)),
+    
+    backlog_mean = mean(backlog),
+    backlog_prob = mean(backlog > 0),
+    
+    imbalance_mean = mean(abs(busy_m1 - busy_m2))
+  )
+}
+
+# -----------------------------
+# 3) ONE FULL REPLICATION (policy = "old" or "new")
+# -----------------------------
+run_one_rep <- function(policy, cal_dates) {
+  n_days_total <- length(cal_dates)
+  
+  # generate calls for the main month only (first n_workdays), then schedule into cal_dates (main+buffer)
+  calls_list <- list()
+  for (d in 1:n_workdays) {
+    c1 <- gen_calls_one_day(d, lambda1, "Type 1")
+    c2 <- gen_calls_one_day(d, lambda2, "Type 2")
+    calls_list[[length(calls_list)+1]] <- c1
+    calls_list[[length(calls_list)+1]] <- c2
+  }
+  calls <- bind_rows(calls_list)
+  if (nrow(calls) == 0) {
+    return(list(
+      wait_days = numeric(0),
+      overtime_m1 = rep(0, n_workdays),
+      overtime_m2 = rep(0, n_workdays),
+      busy_m1 = rep(0, n_workdays),
+      busy_m2 = rep(0, n_workdays),
+      backlog = rep(0, n_workdays)
+    ))
+  }
+  
+  # schedule structure
+  sch <- init_schedule(n_days_total)
+  
+  # for waiting time: appointment day index - call day index (working days)
+  appt_day <- integer(nrow(calls))
+  appt_machine <- character(nrow(calls))
+  
+  # schedule calls in chronological order (call_day then call_time)
+  calls <- calls %>% arrange(call_day, call_time)
+  
+  for (i in 1:nrow(calls)) {
+    pt <- calls$PatientType[i]
+    # "cannot be scheduled same day": earliest is next working day
+    earliest_day <- calls$call_day[i] + 1
+    
+    slot <- find_earliest_slot(sch, earliest_day, pt, policy)
+    sch <- add_to_schedule(sch, slot$day, slot$machine, pt)
+    
+    appt_day[i] <- slot$day
+    appt_machine[i] <- slot$machine
+  }
+  
+  # waiting time in working days (appt_day - call_day)
+  wait_days <- appt_day - calls$call_day
+  
+  # simulate execution for each day in the MAIN month (first n_workdays)
+  overtime_m1 <- rep(0, n_workdays)
+  overtime_m2 <- rep(0, n_workdays)
+  busy_m1 <- rep(0, n_workdays)
+  busy_m2 <- rep(0, n_workdays)
+  
+  for (d in 1:n_workdays) {
+    res1 <- simulate_machine_day(sch$m1_types[[d]], sch$m1_slots[[d]])
+    res2 <- simulate_machine_day(sch$m2_types[[d]], sch$m2_slots[[d]])
+    
+    overtime_m1[d] <- res1$overtime
+    overtime_m2[d] <- res2$overtime
+    busy_m1[d] <- res1$busy
+    busy_m2[d] <- res2$busy
+  }
+  
+  # backlog at end of each main day: number of calls up to day d not yet scheduled by day d+1?
+  # Simple backlog proxy: number of appointments scheduled after day d for calls <= d
+  backlog <- rep(0, n_workdays)
+  for (d in 1:n_workdays) {
+    backlog[d] <- sum(calls$call_day <= d & appt_day > d)
+  }
+  
+  list(
+    wait_days = wait_days,
+    overtime_m1 = overtime_m1,
+    overtime_m2 = overtime_m2,
+    busy_m1 = busy_m1,
+    busy_m2 = busy_m2,
+    backlog = backlog
+  )
+}
+
+# -----------------------------
+# 4) RUN MONTE CARLO FOR BOTH POLICIES
+# -----------------------------
+start_date <- min(workdays$Date_parsed)
+cal_dates <- make_workday_calendar(start_date, n_workdays, BUFFER_DAYS)
+
+simulate_policy <- function(policy) {
+  wait_all <- numeric(0)
+  ot1_all <- numeric(0)
+  ot2_all <- numeric(0)
+  b1_all <- numeric(0)
+  b2_all <- numeric(0)
+  back_all <- numeric(0)
+  
+  for (r in 1:N_REP) {
+    out <- run_one_rep(policy, cal_dates)
+    
+    wait_all <- c(wait_all, out$wait_days)
+    ot1_all <- c(ot1_all, out$overtime_m1)
+    ot2_all <- c(ot2_all, out$overtime_m2)
+    b1_all <- c(b1_all, out$busy_m1)
+    b2_all <- c(b2_all, out$busy_m2)
+    back_all <- c(back_all, out$backlog)
+  }
+  
+  kpi_summary(wait_all, ot1_all, ot2_all, b1_all, b2_all, back_all)
+}
+
+cat("Running simulation...\n")
+kpi_old <- simulate_policy("old")
+kpi_new <- simulate_policy("new")
+
+# -----------------------------
+# 5) OUTPUT COMPARISON TABLE
+# -----------------------------
+comparison <- bind_rows(
+  kpi_old %>% mutate(policy = "Old"),
+  kpi_new %>% mutate(policy = "New")
+) %>%
+  select(policy, everything())
+
+print(comparison)
+
+# Optional: show delta (New - Old)
+delta <- kpi_new - kpi_old
+delta$policy <- "Delta(New-Old)"
+delta <- delta %>% select(policy, everything())
+print(delta)
